@@ -1,25 +1,25 @@
+#ifndef USER_USB_RAM
+
 #include "USBhandler.h"
 
 #include "USBconstant.h"
 
-//Keyboard functions:
-
+//CDC functions:
+void resetCDCParameters();
+void setLineCodingHandler();
+uint16_t getLineCodingHandler();
+void setControlLineStateHandler();
 void USB_EP2_IN();
 void USB_EP2_OUT();
 
 __xdata __at (EP0_ADDR) uint8_t  Ep0Buffer[8];     
-__xdata __at (EP1_ADDR) uint8_t  Ep1Buffer[128];       //on page 47 of data sheet, the receive buffer need to be min(possible packet size+2,64), IN and OUT buffer, must be even address
-
-#if (EP1_ADDR+128) > USER_USB_RAM
-#error "This example needs more USB ram. Increase this setting in menu."
-#endif
+__xdata __at (EP1_ADDR) uint8_t  Ep1Buffer[8];       //on page 47 of data sheet, the receive buffer need to be min(possible packet size+2,64)
+__xdata __at (EP2_ADDR) uint8_t  Ep2Buffer[128];     //IN and OUT buffer, must be even address
 
 uint16_t SetupLen;
 uint8_t SetupReq,UsbConfig;
 
 __code uint8_t *pDescr;
-
-volatile uint8_t usbMsgFlags=0;    // uint8_t usbMsgFlags copied from VUSB
 
 inline void NOP_Process(void) {}
 
@@ -30,7 +30,6 @@ void USB_EP0_SETUP(){
         SetupLen = ((uint16_t)UsbSetupBuf->wLengthH<<8) | (UsbSetupBuf->wLengthL);
         len = 0;                                                      // Default is success and upload 0 length
         SetupReq = UsbSetupBuf->bRequest;
-        usbMsgFlags = 0;
         if ( ( UsbSetupBuf->bRequestType & USB_REQ_TYP_MASK ) != USB_REQ_TYP_STANDARD )//Not standard request
         {
             
@@ -52,7 +51,16 @@ void USB_EP0_SETUP(){
                 case USB_REQ_TYP_CLASS:
                 {
                     switch( SetupReq )
-                    {       
+                    {
+                        case GET_LINE_CODING:   //0x21  currently configured
+                            len = getLineCodingHandler();
+                            break;
+                        case SET_CONTROL_LINE_STATE:  //0x22  generates RS-232/V.24 style control signals
+                            setControlLineStateHandler();
+                            break;
+                        case SET_LINE_CODING:      //0x20  Configure
+                            break;
+                            
                         default:
                             len = 0xFF;                                                                        //command not supported
                             break;
@@ -88,32 +96,28 @@ void USB_EP0_SETUP(){
                         }
                         else if(UsbSetupBuf->wValueL == 1)
                         {
-                            pDescr = Manuf_Des;
+                            pDescr = (__code uint8_t *)Manuf_Des;
                             len = Manuf_DesLen;
                         }
                         else if(UsbSetupBuf->wValueL == 2)
                         {
-                            pDescr = Prod_Des;
+                            pDescr = (__code uint8_t *)Prod_Des;
                             len = Prod_DesLen;
                         }
                         else if(UsbSetupBuf->wValueL == 3)
                         {
-                            pDescr = SerDes;
+                            pDescr = (__code uint8_t *)SerDes;
                             len = SerDesLen;
                         }
-                        else
+                        else if(UsbSetupBuf->wValueL == 4)
                         {
-                            len = 0xff;  
-                        }
-                        break;
-                     case 0x22:
-                        if(UsbSetupBuf->wValueL == 0){
-                            pDescr = ReportDesc;
-                            len = ReportDescLen;
+                            pDescr = (__code uint8_t *)CDC_Des;
+                            len = CDC_DesLen;
                         }
                         else
                         {
-                            len = 0xff;  
+                            pDescr = (__code uint8_t *)SerDes;
+                            len = SerDesLen;
                         }
                         break;
                     default:
@@ -346,12 +350,27 @@ void USB_EP0_IN(){
 }
 
 void USB_EP0_OUT(){
+    if(SetupReq ==SET_LINE_CODING)  //Set line coding
+    {
+        if( U_TOG_OK )
+        {
+            setLineCodingHandler();
+            UEP0_T_LEN = 0;
+            UEP0_CTRL |= UEP_R_RES_ACK | UEP_T_RES_ACK;  // send 0-length packet
+        }
+    }
+    else
     {
         UEP0_T_LEN = 0;
         UEP0_CTRL |= UEP_R_RES_ACK | UEP_T_RES_NAK;  //Respond Nak
     }
 }
 
+
+void USB_EP1_IN(){
+    UEP1_T_LEN = 0;
+    UEP1_CTRL = UEP1_CTRL & ~ MASK_UEP_T_RES | UEP_T_RES_NAK;           // Default NAK
+}
 
 
 #pragma save
@@ -417,12 +436,16 @@ void USBInterrupt(void) {   //inline not really working in multiple files in SDC
     // Device mode USB bus reset
     if(UIF_BUS_RST) {
         UEP0_CTRL = UEP_R_RES_ACK | UEP_T_RES_NAK;
-        UEP1_CTRL = bUEP_AUTO_TOG | UEP_T_RES_NAK | UEP_R_RES_ACK;
+        UEP1_CTRL = bUEP_AUTO_TOG | UEP_T_RES_NAK;                //Endpoint 1 automatically flips the sync flag, and IN transaction returns NAK
+        UEP2_CTRL = bUEP_AUTO_TOG | UEP_T_RES_NAK | UEP_R_RES_ACK;        //Endpoint 2 automatically flips the sync flag, IN transaction returns NAK, OUT returns ACK
+        //UEP4_CTRL = UEP_T_RES_NAK | UEP_R_RES_ACK;  //bUEP_AUTO_TOG only work for endpoint 1,2,3
         
         USB_DEV_AD = 0x00;
         UIF_SUSPEND = 0;
         UIF_TRANSFER = 0;
         UIF_BUS_RST = 0;                                                        // Clear interrupt flag
+        
+        resetCDCParameters();
     }
     
     // USB bus suspend / wake up
@@ -456,7 +479,13 @@ void USBDeviceCfg()
     //     UDEV_CTRL |= bUD_LOW_SPEED;                                                //Run for 1.5M
     USB_CTRL &= ~bUC_LOW_SPEED;
     UDEV_CTRL &= ~bUD_LOW_SPEED;                                             //Select full speed 12M mode, default mode
+
+#if defined(CH551) || defined(CH552) || defined(CH549)
     UDEV_CTRL = bUD_PD_DIS;                                                     // Disable DP/DM pull-down resistor
+#endif
+#if defined(CH559)
+    UDEV_CTRL = bUD_DP_PD_DIS;                                                     // Disable DP/DM pull-down resistor
+#endif
     UDEV_CTRL |= bUD_PORT_EN;                                                  //Enable physical port
 }
 
@@ -472,9 +501,26 @@ void USBDeviceIntCfg()
 
 void USBDeviceEndPointCfg()
 {
-    UEP1_DMA = (uint16_t) Ep1Buffer;                                                      //Endpoint 1 data transfer address
-    UEP1_CTRL = bUEP_AUTO_TOG | UEP_T_RES_NAK | UEP_R_RES_ACK;        //Endpoint 2 automatically flips the sync flag, IN transaction returns NAK, OUT returns ACK
+#if defined(CH559)
+    //CH559 use differend endianness for these registers
+    UEP0_DMA_H = ((uint16_t)Ep0Buffer >> 8);                                                      //Endpoint 0 data transfer address
+    UEP0_DMA_L = ((uint16_t)Ep0Buffer >> 0);                                                      //Endpoint 0 data transfer address
+    UEP1_DMA_H = ((uint16_t)Ep1Buffer >> 8);                                                      //Endpoint 1 data transfer address
+    UEP1_DMA_L = ((uint16_t)Ep1Buffer >> 0);                                                      //Endpoint 1 data transfer address
+    UEP2_DMA_H = ((uint16_t)Ep2Buffer >> 8);                                                      //Endpoint 2 data transfer address
+    UEP2_DMA_L = ((uint16_t)Ep2Buffer >> 0);                                                      //Endpoint 2 data transfer address
+#else
     UEP0_DMA = (uint16_t) Ep0Buffer;                                                      //Endpoint 0 data transfer address
-    UEP4_1_MOD = 0XC0;                                                         //endpoint1 TX RX enable
+    UEP1_DMA = (uint16_t) Ep1Buffer;                                                      //Endpoint 1 data transfer address
+    UEP2_DMA = (uint16_t) Ep2Buffer;                                                      //Endpoint 2 data transfer address
+#endif
+    
+    UEP2_3_MOD = 0x0C;                                                         //Endpoint2 double buffer
+    UEP1_CTRL = bUEP_AUTO_TOG | UEP_T_RES_NAK;                //Endpoint 1 automatically flips the sync flag, and IN transaction returns NAK
+    UEP2_CTRL = bUEP_AUTO_TOG | UEP_T_RES_NAK | UEP_R_RES_ACK;        //Endpoint 2 automatically flips the sync flag, IN transaction returns NAK, OUT returns ACK
+    
+    UEP4_1_MOD = 0X40;                                                         //endpoint1 TX enable
     UEP0_CTRL = UEP_R_RES_ACK | UEP_T_RES_NAK;                //Manual flip, OUT transaction returns ACK, IN transaction returns NAK
 }
+
+#endif
